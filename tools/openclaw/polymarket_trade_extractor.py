@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 DATA_BASE = "https://data-api.polymarket.com"
@@ -30,7 +30,7 @@ class Market:
     slug: Optional[str]
 
 
-def _get_json(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = 3):
+def _get_json(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = 3) -> Any:
     req = urllib.request.Request(
         url,
         headers={
@@ -58,7 +58,7 @@ def _get_json(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = 3):
 
 
 def fetch_active_markets(limit: int, max_pages: int, pause_ms: int) -> List[Market]:
-    seen: set = set()
+    seen: set[str] = set()
     markets: List[Market] = []
     offset = 0
 
@@ -75,18 +75,21 @@ def fetch_active_markets(limit: int, max_pages: int, pause_ms: int) -> List[Mark
         url = f"{GAMMA_BASE}/markets?{query}"
         payload = _get_json(url)
 
-        if not payload:
+        if not isinstance(payload, list) or not payload:
             break
 
         for item in payload:
+            if not isinstance(item, dict):
+                continue
+
             condition_id = item.get("conditionId")
-            if condition_id and condition_id not in seen:
+            if isinstance(condition_id, str) and condition_id not in seen:
                 seen.add(condition_id)
                 markets.append(
                     Market(
                         condition_id=condition_id,
-                        question=item.get("question", ""),
-                        slug=item.get("slug"),
+                        question=str(item.get("question", "")),
+                        slug=item.get("slug") if isinstance(item.get("slug"), str) else None,
                     )
                 )
 
@@ -117,15 +120,22 @@ def fetch_trades_for_market(condition_id: str, since_unix: int, limit: int, paus
             payload = _get_json(url)
         except RuntimeError as exc:
             raise RuntimeError(f"Failed fetching trades page (offset={offset}): {exc}") from exc
-        if not payload:
+
+        if not isinstance(payload, list) or not payload:
             break
 
         reached_older = False
         for trade in payload:
-            ts = trade.get("timestamp")
-            if ts is None:
+            if not isinstance(trade, dict):
                 continue
-            if int(ts) < since_unix:
+
+            ts = trade.get("timestamp")
+            try:
+                ts_int = int(ts)
+            except (TypeError, ValueError):
+                continue
+
+            if ts_int < since_unix:
                 reached_older = True
             else:
                 all_trades.append(trade)
@@ -156,6 +166,20 @@ def _positive_float(v: str) -> float:
     return f
 
 
+def _positive_int(v: str) -> int:
+    i = int(v)
+    if i <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return i
+
+
+def _non_negative_int(v: str) -> int:
+    i = int(v)
+    if i < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return i
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Extract Polymarket trades from the past X hours.")
     p.add_argument("--hours", type=_positive_float, required=True, help="Trailing window in hours (e.g. 6, 24).")
@@ -164,10 +188,10 @@ def parse_args() -> argparse.Namespace:
         default="-",
         help="Output path for JSON array results. Use '-' for stdout (default).",
     )
-    p.add_argument("--market-page-size", type=int, default=200)
-    p.add_argument("--market-max-pages", type=int, default=15)
-    p.add_argument("--trade-page-size", type=int, default=500)
-    p.add_argument("--pause-ms", type=int, default=50, help="Delay between API requests.")
+    p.add_argument("--market-page-size", type=_positive_int, default=200)
+    p.add_argument("--market-max-pages", type=_positive_int, default=15)
+    p.add_argument("--trade-page-size", type=_positive_int, default=500)
+    p.add_argument("--pause-ms", type=_non_negative_int, default=50, help="Delay between API requests.")
     return p.parse_args()
 
 
