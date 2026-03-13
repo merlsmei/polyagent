@@ -12,6 +12,7 @@ import datetime as dt
 import json
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ class Market:
     slug: Optional[str]
 
 
-def _get_json(url: str, timeout: int = DEFAULT_TIMEOUT):
+def _get_json(url: str, timeout: int = DEFAULT_TIMEOUT, retries: int = 3):
     req = urllib.request.Request(
         url,
         headers={
@@ -37,11 +38,27 @@ def _get_json(url: str, timeout: int = DEFAULT_TIMEOUT):
             "Accept": "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    delay = 1.0
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if (e.code == 429 or e.code >= 500) and attempt < retries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise RuntimeError(f"HTTP {e.code} fetching {url}: {e.reason}") from e
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise RuntimeError(f"Network error fetching {url}: {e.reason}") from e
 
 
 def fetch_active_markets(limit: int, max_pages: int, pause_ms: int) -> List[Market]:
+    seen: set = set()
     markets: List[Market] = []
     offset = 0
 
@@ -63,7 +80,8 @@ def fetch_active_markets(limit: int, max_pages: int, pause_ms: int) -> List[Mark
 
         for item in payload:
             condition_id = item.get("conditionId")
-            if condition_id:
+            if condition_id and condition_id not in seen:
+                seen.add(condition_id)
                 markets.append(
                     Market(
                         condition_id=condition_id,
@@ -79,16 +97,7 @@ def fetch_active_markets(limit: int, max_pages: int, pause_ms: int) -> List[Mark
         if pause_ms > 0:
             time.sleep(pause_ms / 1000)
 
-    # Deduplicate by condition_id while preserving order.
-    seen = set()
-    deduped: List[Market] = []
-    for m in markets:
-        if m.condition_id in seen:
-            continue
-        seen.add(m.condition_id)
-        deduped.append(m)
-
-    return deduped
+    return markets
 
 
 def fetch_trades_for_market(condition_id: str, since_unix: int, limit: int, pause_ms: int) -> List[Dict]:
@@ -104,7 +113,10 @@ def fetch_trades_for_market(condition_id: str, since_unix: int, limit: int, paus
             }
         )
         url = f"{DATA_BASE}/trades?{query}"
-        payload = _get_json(url)
+        try:
+            payload = _get_json(url)
+        except RuntimeError as exc:
+            raise RuntimeError(f"Failed fetching trades page (offset={offset}): {exc}") from exc
         if not payload:
             break
 
@@ -115,8 +127,8 @@ def fetch_trades_for_market(condition_id: str, since_unix: int, limit: int, paus
                 continue
             if int(ts) < since_unix:
                 reached_older = True
-                continue
-            all_trades.append(trade)
+            else:
+                all_trades.append(trade)
 
         if len(payload) < limit or reached_older:
             break
@@ -137,9 +149,16 @@ def enrich_trades(trades: Iterable[Dict], market: Market) -> Iterable[Dict]:
         yield out
 
 
+def _positive_float(v: str) -> float:
+    f = float(v)
+    if f <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return f
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Extract Polymarket trades from the past X hours.")
-    p.add_argument("--hours", type=float, required=True, help="Trailing window in hours (e.g. 6, 24).")
+    p.add_argument("--hours", type=_positive_float, required=True, help="Trailing window in hours (e.g. 6, 24).")
     p.add_argument(
         "--output",
         default="-",
@@ -154,10 +173,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-
-    if args.hours <= 0:
-        print("--hours must be > 0", file=sys.stderr)
-        return 2
 
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=args.hours)
     since_unix = int(since.timestamp())
