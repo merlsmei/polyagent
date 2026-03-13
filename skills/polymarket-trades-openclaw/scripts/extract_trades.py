@@ -13,5 +13,6 @@ if not TOOL.exists():
 
 spec = importlib.util.spec_from_file_location("polymarket_trade_extractor", TOOL)
 mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
 spec.loader.exec_module(mod)
 sys.exit(mod.main())
